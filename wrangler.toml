@@ -1,6 +1,7 @@
 name = "bokerr-api"
 main = "src/index.ts"
 compatibility_date = "2026-10-18"
+account_id = "f5be5b6566389f0a3891e4aef606cab7"
 
 [durable_objects]
 bindings = [
@@ -14,7 +15,7 @@ new_sqlite_classes = ["PokerTable"]
 [[d1_databases]]
 binding = "DB"
 database_name = "bokerr"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "17620c13-4cf7-475d-91d0-4de65e83a3a7"
 
 [vars]
 ALLOWED_ORIGIN = "https://your-app.example"
