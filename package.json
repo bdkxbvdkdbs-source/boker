@@ -1,0 +1,14 @@
+{
+  "name": "bokerr-api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 execute bokerr --remote --file schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.151.1",
+    "@cloudflare/workers-types": "^5.20261016.1"
+  }
+}
