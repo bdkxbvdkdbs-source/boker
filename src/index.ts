@@ -1,10 +1,14 @@
-import { advance, bestScore, startRound, visibleBoard, type Round, type Variant } from './poker';
+import { Master } from 'boardgame.io/master';
+import { getFilterPlayerView } from 'boardgame.io/internal';
+import { DurableMatchStorage } from './boardgame-storage';
+import { createPokerGame, type PokerState, type Variant } from './poker';
 
 export interface Env {
   DB: D1Database;
   POKER_TABLE: DurableObjectNamespace;
   SESSION_KV: KVNamespace;
-  ALLOWED_ORIGIN: string;
+  ALLOWED_ORIGINS?: string;
+  ALLOWED_ORIGIN?: string;
   ADMIN_TOKEN?: string;
 }
 
@@ -16,27 +20,34 @@ type SessionRecord = {
   lastTableId: string | null;
 };
 
-type StoredGame = {
-  round: Round | null;
-  usedActions: string[];
-  playerNames: Record<string, string>;
-};
-
 type TableConfig = {
   name: string;
   variant: Variant;
   capacity: number;
   blinds: string;
+  buyInMin: number;
+  buyInMax: number;
 };
+
+type Identity = { id: string; name: string; seat: number; ready: boolean };
+type SeatRecord = { seat: number; name: string };
+type RoomRecord = { seats: Record<string, SeatRecord>; usedActions: string[] };
+type BgState = { G: PokerState; ctx: { currentPlayer: string; numPlayers: number }; _stateID: number; [key: string]: any };
+type BoardgameMaster = InstanceType<typeof Master>;
 
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const tableConfig: Record<string, TableConfig> = {
-  'berlin-9max': { name: 'طاولة بوكر تكساس', variant: 'texas', capacity: 9, blinds: '5 / 10' },
-  'london-5max': { name: 'طاولة بوكر أوماها', variant: 'omaha', capacity: 5, blinds: '5 / 10' },
+  'berlin-9max': { name: 'طاولة بوكر تكساس', variant: 'texas', capacity: 9, blinds: '5 / 10', buyInMin: 350, buyInMax: 5000 },
+  'london-5max': { name: 'طاولة بوكر أوماها', variant: 'omaha', capacity: 5, blinds: '5 / 10', buyInMin: 500, buyInMax: 5000 },
 };
 
-function responseHeaders(origin: string): Headers {
-  return new Headers({
+function allowedOrigins(env: Env): string[] {
+  return (env.ALLOWED_ORIGINS || env.ALLOWED_ORIGIN || 'https://appassets.androidplatform.net')
+    .split(',').map((value) => value.trim()).filter(Boolean);
+}
+
+function responseHeaders(origin = '*'): Headers {
+  const headers = new Headers({
     'content-type': 'application/json; charset=utf-8',
     'access-control-allow-origin': origin,
     'access-control-allow-headers': 'content-type, authorization',
@@ -44,6 +55,7 @@ function responseHeaders(origin: string): Headers {
     'vary': 'Origin',
     'cache-control': 'no-store',
   });
+  return headers;
 }
 
 function json(data: unknown, status = 200, origin = '*'): Response {
@@ -123,12 +135,15 @@ async function sessionApi(request: Request, env: Env, origin: string): Promise<R
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const origin = env.ALLOWED_ORIGIN || '*';
+    const requestOrigin = request.headers.get('Origin');
+    const origins = allowedOrigins(env);
+    if (requestOrigin && !origins.includes(requestOrigin)) return json({ error: 'origin_not_allowed' }, 403, 'null');
+    const origin = requestOrigin || origins[0] || '*';
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: responseHeaders(origin) });
     const url = new URL(request.url);
 
     try {
-      if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, service: 'bokerr-api' }, 200, origin);
+      if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, service: 'bokerr-api', engine: 'boardgame.io' }, 200, origin);
       if (url.pathname === '/api/tables' && request.method === 'GET') return json(await listTables(env), 200, origin);
       if (url.pathname === '/api/session') return await sessionApi(request, env, origin);
 
@@ -189,25 +204,29 @@ async function admin(path: string, request: Request, env: Env): Promise<unknown>
 }
 
 export class PokerTable {
-  state: DurableObjectState;
-  env: Env;
-  connections = new Map<WebSocket, { id: string; name: string }>();
-  round: Round | null = null;
-  usedActions = new Set<string>();
-  playerNames: Record<string, string> = {};
-  tableId = '';
-  ready: Promise<void>;
-  serial: Promise<void> = Promise.resolve();
+  private readonly state: DurableObjectState;
+  private readonly env: Env;
+  private readonly connections = new Map<WebSocket, Identity>();
+  private readonly seats: Record<string, SeatRecord> = {};
+  private readonly usedActions = new Set<string>();
+  private tableId = '';
+  private config: TableConfig | null = null;
+  private game: ReturnType<typeof createPokerGame> | null = null;
+  private storage: DurableMatchStorage | null = null;
+  private master: BoardgameMaster | null = null;
+  private filterPlayerView: ReturnType<typeof getFilterPlayerView> | null = null;
+  private lastState: BgState | null = null;
+  private ready: Promise<void>;
+  private serial: Promise<void> = Promise.resolve();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
     this.ready = state.blockConcurrencyWhile(async () => {
-      const stored = await state.storage.get<StoredGame>('gameState');
+      const stored = await state.storage.get<RoomRecord>('boardgameRoom');
       if (stored) {
-        this.round = stored.round;
-        this.usedActions = new Set(stored.usedActions || []);
-        this.playerNames = stored.playerNames || {};
+        Object.assign(this.seats, stored.seats || {});
+        for (const actionId of stored.usedActions || []) this.usedActions.add(actionId);
       }
     });
   }
@@ -216,162 +235,333 @@ export class PokerTable {
     await this.ready;
     const url = new URL(request.url);
     if (url.pathname === '/state') {
+      const state = await this.loadState();
+      const seated = new Set(Array.from(this.connections.values(), (player) => player.id)).size;
       return Response.json({
-        seated: new Set(Array.from(this.connections.values(), (player) => player.id)).size,
-        stage: this.round?.stage || 'waiting',
-        board: this.round ? visibleBoard(this.round) : [],
+        seated,
+        stage: state?.G.stage || 'waiting',
+        board: state?.G.board || [],
+        variant: this.config?.variant,
+        capacity: this.config?.capacity,
       });
     }
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('WebSocket required', { status: 426 });
 
     const tableId = request.headers.get('x-bokerr-table-id') || '';
-    const config = tableConfig[tableId];
     const playerId = request.headers.get('x-bokerr-player-id');
-    if (!config || !playerId) return new Response('Session required', { status: 401 });
+    if (!Object.hasOwn(tableConfig, tableId) || !playerId) return new Response('Session required', { status: 401 });
     let playerName = 'لاعب';
-    try { playerName = decodeURIComponent(request.headers.get('x-bokerr-player-name') || 'لاعب').slice(0, 24) || 'لاعب'; } catch { /* use fallback */ }
+    try { playerName = decodeURIComponent(request.headers.get('x-bokerr-player-name') || 'لاعب').slice(0, 24) || 'لاعب'; } catch { /* fallback */ }
 
-    if (this.round && this.round.stage !== 'showdown' && !this.round.players.some((player) => player.id === playerId)) {
-      return new Response('Round already started', { status: 409 });
+    try {
+      return await this.enqueue(() => this.acceptConnection(request, tableId, playerId, playerName));
+    } catch (error) {
+      return new Response(error instanceof Error ? error.message : 'table_unavailable', { status: 409 });
     }
+  }
+
+  private async acceptConnection(request: Request, tableId: string, playerId: string, playerName: string): Promise<Response> {
+    this.configure(tableId);
+    const seat = await this.assignSeat(playerId, playerName);
     for (const [socket, identity] of this.connections) {
       if (identity.id === playerId) {
         this.connections.delete(socket);
         try { socket.close(4001, 'reconnected'); } catch { /* already closed */ }
       }
     }
-    const seatedIds = new Set(Array.from(this.connections.values(), (player) => player.id));
-    if (!seatedIds.has(playerId) && seatedIds.size >= config.capacity) return new Response('Table is full', { status: 409 });
 
-    this.tableId = tableId;
-    this.playerNames[playerId] = playerName;
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
-    const identity = { id: playerId, name: playerName };
+    const identity: Identity = { id: playerId, name: playerName, seat, ready: false };
     this.connections.set(server, identity);
     server.addEventListener('close', () => {
-      this.connections.delete(server);
-      this.broadcastPresence();
-    });
-    server.addEventListener('message', (event) => {
-      this.serial = this.serial.then(() => this.handle(server, identity, String(event.data))).catch((error) => {
-        this.send(server, { type: 'error', error: error instanceof Error ? error.message : 'internal_error' });
+      void this.enqueue(async () => {
+        this.connections.delete(server);
+        if (Array.from(this.connections.values()).some((connected) => connected.id === identity.id)) return;
+        const master = this.master;
+        if (master) {
+          await master.onConnectionChange(tableId, String(seat), undefined, false);
+          const state = await this.loadState();
+          if (state && ['waiting', 'showdown'].includes(state.G.stage)) {
+            await this.runInternalMove('serverDisconnected', [seat], state);
+          }
+        }
+        this.broadcastPresence();
+        const state = await this.loadState();
+        if (state) this.broadcastState(state);
       });
     });
-    server.send(JSON.stringify({ type: 'ready', playerId, turnSeconds: 20 }));
-    this.broadcastPresence();
-    if (this.round && this.round.stage !== 'showdown') this.sendState(server, playerId);
-    await this.persist();
+    server.addEventListener('message', (event) => {
+      void this.enqueue(() => this.handle(server, identity, String(event.data)));
+    });
 
+    const master = this.ensureMaster();
+    const syncResult = await master.onSync(tableId, String(seat), undefined, this.config!.capacity);
+    if (syncResult && 'error' in syncResult) throw new Error(syncResult.error);
+    await master.onConnectionChange(tableId, String(seat), undefined, true);
+    const state = await this.loadState();
+    if (!state) throw new Error('game_initialization_failed');
+    if (['waiting', 'showdown'].includes(state.G.stage)) {
+      await this.runInternalMove('serverSeat', [seat, playerId, playerName], state);
+    }
+
+    identity.ready = true;
+    const current = await this.loadState();
+    this.send(server, { type: 'ready', playerId, playerIndex: seat, turnSeconds: 30, stateID: current?._stateID ?? 0 });
+    this.broadcastPresence();
+    if (current) this.broadcastState(current);
     const headers = new Headers({ 'Sec-WebSocket-Protocol': 'bokerr-v1' });
     return new Response(null, { status: 101, webSocket: client, headers });
   }
 
-  async handle(socket: WebSocket, identity: { id: string; name: string }, raw: string): Promise<void> {
-    let message: { type?: unknown; actionId?: unknown };
+  private configure(tableId: string) {
+    if (this.master) {
+      if (this.tableId !== tableId) throw new Error('table_mismatch');
+      return;
+    }
+    const config = tableConfig[tableId];
+    if (!config) throw new Error('unknown_table');
+    this.tableId = tableId;
+    this.config = config;
+    this.game = createPokerGame(config.variant, config.capacity);
+    this.storage = new DurableMatchStorage(this.state.storage, tableId);
+    this.filterPlayerView = getFilterPlayerView(this.game as any);
+    const transport = { send: () => {}, sendAll: () => {} };
+    this.master = new Master(this.game as any, this.storage as any, transport as any);
+    this.master.subscribe(({ state, matchID }) => {
+      if (matchID === this.tableId) this.lastState = state as BgState;
+    });
+  }
+
+  private ensureMaster(): BoardgameMaster {
+    if (!this.master) throw new Error('table_not_configured');
+    return this.master;
+  }
+
+  private async assignSeat(playerId: string, name: string): Promise<number> {
+    const existing = this.seats[playerId];
+    if (existing) {
+      existing.name = name;
+      await this.persistRoom();
+      return existing.seat;
+    }
+    const state = await this.loadState();
+    const inHandSeats = state && !['waiting', 'showdown'].includes(state.G.stage)
+      ? state.G.players.filter((player) => player.inHand && !player.folded).map((player) => player.seat)
+      : [];
+    const connectedSeats = new Set(Array.from(this.connections.values(), (player) => player.seat));
+    const capacity = this.config!.capacity;
+    let seat = -1;
+    for (let candidate = 0; candidate < capacity; candidate += 1) {
+      if (connectedSeats.has(candidate) || inHandSeats.includes(candidate)) continue;
+      seat = candidate;
+      break;
+    }
+    if (seat < 0) throw new Error('table_full');
+    for (const [otherId, record] of Object.entries(this.seats)) {
+      if (record.seat === seat) delete this.seats[otherId];
+    }
+    this.seats[playerId] = { seat, name };
+    await this.persistRoom();
+    return seat;
+  }
+
+  private async handle(socket: WebSocket, identity: Identity, raw: string): Promise<void> {
+    let message: { type?: unknown; actionId?: unknown; stateID?: unknown; amount?: unknown };
     try { message = JSON.parse(raw); } catch { this.send(socket, { type: 'error', error: 'malformed_message' }); return; }
     if (typeof message.actionId !== 'string' || message.actionId.length < 8 || message.actionId.length > 80) {
       this.send(socket, { type: 'error', error: 'invalid_action_id' });
       return;
     }
     if (this.usedActions.has(message.actionId)) {
-      this.send(socket, { type: 'error', error: 'replayed_action' });
+      this.send(socket, { type: 'error', error: 'replayed_action', actionId: message.actionId });
       return;
     }
     this.usedActions.add(message.actionId);
-    while (this.usedActions.size > 256) this.usedActions.delete(this.usedActions.values().next().value as string);
+    while (this.usedActions.size > 512) this.usedActions.delete(this.usedActions.values().next().value as string);
+    await this.persistRoom();
 
-    if (message.type === 'start') {
-      if (this.round && this.round.stage !== 'showdown') { this.send(socket, { type: 'error', error: 'round_in_progress' }); return; }
-      const config = tableConfig[this.tableId];
-      const players = Array.from(new Map(Array.from(this.connections.values(), (player) => [player.id, player])).values());
-      if (!config || players.length < 2 || players.length > config.capacity) { this.send(socket, { type: 'error', error: 'need_two_players' }); return; }
-      for (const player of players) this.playerNames[player.id] = player.name;
-      this.round = startRound(config.variant, players.map((player) => player.id));
-      this.usedActions.clear();
-      this.usedActions.add(message.actionId);
-      await this.persist();
-      this.broadcast({ type: 'round_started', stage: this.round.stage });
-      this.broadcastState();
+    const master = this.ensureMaster();
+    const state = await this.loadState();
+    if (!state) { this.send(socket, { type: 'error', error: 'game_not_ready', actionId: message.actionId }); return; }
+    if (message.stateID !== undefined && (!Number.isInteger(message.stateID) || message.stateID !== state._stateID)) {
+      this.send(socket, { type: 'error', error: 'stale_state', actionId: message.actionId });
+      this.sendState(socket, identity, state);
       return;
     }
 
-    if (!this.round || this.round.stage === 'showdown') { this.send(socket, { type: 'error', error: 'round_not_started' }); return; }
-    const player = this.round.players[this.round.turnIndex];
-    if (player.id !== identity.id) { this.send(socket, { type: 'error', error: 'not_your_turn' }); return; }
-    if (!['fold', 'check', 'call', 'bet'].includes(String(message.type))) { this.send(socket, { type: 'error', error: 'unsupported_action' }); return; }
+    if (message.type === 'start' || message.type === 'startNextHand') {
+      if (!['waiting', 'showdown'].includes(state.G.stage)) {
+        this.send(socket, { type: 'error', error: 'round_in_progress', actionId: message.actionId });
+        return;
+      }
+      const participants = Array.from(new Map(Array.from(this.connections.values(), (p) => [p.id, p])).values())
+        .map((player) => ({ seat: player.seat, id: player.id, name: player.name }));
+      if (participants.length < 2) {
+        this.send(socket, { type: 'error', error: 'need_two_players', actionId: message.actionId });
+        return;
+      }
+      const beforeStage = state.G.stage;
+      const after = await this.runInternalMove('serverStartHand', [participants], state);
+      if (!after || after._stateID === state._stateID) {
+        this.send(socket, { type: 'error', error: 'could_not_start_hand', actionId: message.actionId });
+        return;
+      }
+      this.broadcast({ type: 'round_started', stage: after.G.stage, handNumber: after.G.handNumber, resumed: beforeStage === 'showdown' });
+      this.broadcastState(after);
+      this.broadcastPresence();
+      return;
+    }
 
-    if (message.type === 'fold') player.folded = true;
-    else {
-      const amount = message.type === 'bet' ? 10 : 5;
-      player.committed += amount;
-      this.round.pot += amount;
+    const allowed = new Set(['fold', 'check', 'call', 'bet', 'raise', 'allIn']);
+    if (typeof message.type !== 'string' || !allowed.has(message.type)) {
+      this.send(socket, { type: 'error', error: 'unsupported_action', actionId: message.actionId });
+      return;
     }
-    this.round = advance(this.round);
-    await this.persist();
-    if (this.round.stage === 'showdown') {
-      const winners = this.round.players.filter((item) => !item.folded)
-        .sort((a, b) => compare(bestScore(this.round as Round, b), bestScore(this.round as Round, a)))
-        .slice(0, 1).map((item) => item.id);
-      this.broadcast({ type: 'showdown', pot: this.round.pot, winners });
-    } else {
-      this.broadcast({ type: 'action', action: message.type, stage: this.round.stage, pot: this.round.pot });
+    if (!['preflop', 'flop', 'turn', 'river'].includes(state.G.stage)) {
+      this.send(socket, { type: 'error', error: 'round_not_started', actionId: message.actionId });
+      return;
     }
-    this.broadcastState();
+    if (state.ctx.currentPlayer !== String(identity.seat)) {
+      this.send(socket, { type: 'error', error: 'not_your_turn', actionId: message.actionId });
+      return;
+    }
+    if ((message.type === 'bet' || message.type === 'raise') && (!Number.isSafeInteger(message.amount) || (message.amount as number) <= 0)) {
+      this.send(socket, { type: 'error', error: 'invalid_amount', actionId: message.actionId });
+      return;
+    }
+
+    const args = message.type === 'bet' || message.type === 'raise' ? [message.amount] : [];
+    const after = await this.runPlayerMove(identity, message.type, args, state, message.stateID as number | undefined);
+    if (!after || after._stateID === state._stateID) {
+      this.send(socket, { type: 'error', error: 'invalid_action', actionId: message.actionId });
+      this.sendState(socket, identity, await this.loadState() || state);
+      return;
+    }
+    this.broadcast({ type: 'action', action: message.type, stage: after.G.stage, pot: after.G.pot, actionId: message.actionId });
+    if (after.G.stage === 'showdown' && state.G.stage !== 'showdown') {
+      this.broadcast({ type: 'showdown', pot: after.G.pot, winners: after.G.result?.winners || [], winningSeats: after.G.result?.winningSeats || [], resultMessage: after.G.result?.description || '' });
+    }
+    this.broadcastState(after);
+    this.broadcastPresence();
   }
 
-  async persist(): Promise<void> {
-    await this.state.storage.put('gameState', {
-      round: this.round,
+  private async runInternalMove(name: string, args: unknown[], state: BgState): Promise<BgState | null> {
+    const actor = state.ctx.currentPlayer;
+    return this.runMove(name, args, actor, state._stateID);
+  }
+
+  private async runPlayerMove(identity: Identity, name: string, args: unknown[], state: BgState, stateID?: number): Promise<BgState | null> {
+    return this.runMove(name, args, String(identity.seat), stateID ?? state._stateID);
+  }
+
+  private async runMove(name: string, args: unknown[], playerID: string, stateID: number): Promise<BgState | null> {
+    const result = await this.ensureMaster().onUpdate({
+      type: 'MAKE_MOVE',
+      payload: { type: name, args, playerID },
+    } as any, stateID, this.tableId, playerID);
+    if (result && 'error' in result) return null;
+    return this.loadState();
+  }
+
+  private async loadState(): Promise<BgState | null> {
+    if (!this.storage) return null;
+    const result = await this.storage.fetch(this.tableId, { state: true } as const) as { state?: BgState };
+    return result.state || null;
+  }
+
+  private async persistRoom() {
+    await this.state.storage.put('boardgameRoom', {
+      seats: this.seats,
       usedActions: Array.from(this.usedActions),
-      playerNames: this.playerNames,
-    } satisfies StoredGame);
+    } satisfies RoomRecord);
   }
 
-  sendState(socket: WebSocket, playerId: string): void {
-    if (!this.round) return;
-    const own = this.round.players.find((player) => player.id === playerId);
-    this.send(socket, {
+  private async enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const task = this.serial.then(operation);
+    this.serial = task.then(() => undefined, () => undefined);
+    return task;
+  }
+
+  private sendState(socket: WebSocket, identity: Identity, state: BgState) {
+    const filter = this.filterPlayerView;
+    const filtered = filter
+      ? (filter(String(identity.seat), { type: 'update', args: [this.tableId, state] } as any) as any).args[1] as BgState
+      : state;
+    const G = filtered.G;
+    const currentSeat = Number(filtered.ctx.currentPlayer);
+    const own = G.players[identity.seat];
+    const players = G.players.filter((player) => player.sessionId || player.inHand).map((player) => ({
+      id: player.sessionId || `seat-${player.seat}`,
+      name: player.name,
+      seat: player.seat,
+      stack: player.chips,
+      bet: player.streetBet,
+      folded: player.folded,
+      allIn: player.allIn,
+      isConnected: this.isSeatConnected(player.seat),
+      isTurn: player.seat === currentSeat && ['preflop', 'flop', 'turn', 'river'].includes(G.stage),
+    }));
+    const message = {
       type: 'state',
-      stage: this.round.stage,
-      variant: this.round.variant,
-      board: visibleBoard(this.round),
-      pot: this.round.pot,
-      currentPlayerId: this.round.players[this.round.turnIndex]?.id,
-      yourCards: own?.hole || [],
-      players: this.round.players.map((player) => ({
+      stateID: state._stateID,
+      stage: G.stage,
+      variant: G.variant,
+      board: G.board,
+      pot: G.pot,
+      currentPlayerId: G.players[currentSeat]?.sessionId || null,
+      currentPlayerIndex: currentSeat,
+      yourCards: own?.holeCards || [],
+      players,
+      dealerId: G.players[G.buttonSeat]?.sessionId || null,
+      dealerSeat: G.buttonSeat,
+      smallBlind: G.smallBlind,
+      bigBlind: G.bigBlind,
+      currentBet: G.currentBet,
+      toCall: own ? Math.max(0, G.currentBet - own.streetBet) : 0,
+      minRaise: G.minRaise,
+      winners: G.result?.winners || [],
+      winningSeats: G.result?.winningSeats || [],
+      resultMessage: G.result?.description || '',
+      payouts: G.result?.payouts || {},
+      lastAction: G.lastAction,
+      handNumber: G.handNumber,
+    };
+    this.send(socket, message);
+  }
+
+  private broadcastState(state: BgState) {
+    for (const [socket, identity] of this.connections) {
+      if (identity.ready) this.sendState(socket, identity, state);
+    }
+  }
+
+  private broadcastPresence() {
+    const state = this.lastState;
+    const seats = Array.from(new Map(Array.from(this.connections.values(), (player) => [player.seat, player])).values())
+      .map((player) => ({
         id: player.id,
-        name: this.playerNames[player.id] || 'لاعب',
-        folded: player.folded,
-        committed: player.committed,
-        isTurn: player.id === this.round?.players[this.round.turnIndex]?.id,
-      })),
-    });
+        name: player.name,
+        seat: player.seat,
+        isConnected: true,
+        stack: state?.G.players[player.seat]?.chips ?? 1000,
+        folded: state?.G.players[player.seat]?.folded ?? false,
+        allIn: state?.G.players[player.seat]?.allIn ?? false,
+        isTurn: state?.ctx.currentPlayer === String(player.seat),
+      }));
+    this.broadcast({ type: 'presence', seated: seats.length, players: seats });
   }
 
-  broadcastState(): void {
-    for (const [socket, identity] of this.connections) this.sendState(socket, identity.id);
+  private broadcast(data: unknown) {
+    for (const [socket, identity] of this.connections) if (identity.ready) this.send(socket, data);
   }
 
-  broadcastPresence(): void {
-    const players = Array.from(new Map(Array.from(this.connections.values(), (player) => [player.id, player])).values())
-      .map((player) => ({ id: player.id, name: player.name }));
-    this.broadcast({ type: 'presence', seated: players.length, players });
+  private isSeatConnected(seat: number) {
+    return Array.from(this.connections.values()).some((identity) => identity.seat === seat);
   }
 
-  broadcast(data: unknown): void {
-    for (const socket of this.connections.keys()) this.send(socket, data);
-  }
-
-  send(socket: WebSocket, data: unknown): void {
+  private send(socket: WebSocket, data: unknown) {
     try { socket.send(JSON.stringify(data)); } catch { /* disconnected */ }
   }
-}
-
-function compare(a: number[], b: number[]): number {
-  for (let index = 0; index < Math.max(a.length, b.length); index++) {
-    if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) - (b[index] || 0);
-  }
-  return 0;
 }
