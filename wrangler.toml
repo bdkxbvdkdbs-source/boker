@@ -17,7 +17,11 @@ binding = "DB"
 database_name = "bokerr"
 database_id = "17620c13-4cf7-475d-91d0-4de65e83a3a7"
 
-[vars]
-ALLOWED_ORIGIN = "https://your-app.example"
+[[kv_namespaces]]
+binding = "SESSION_KV"
+id = "1fa59ee8c5fd43d68d205646bcdf7871"
 
-# Set these with `wrangler secret put ADMIN_TOKEN` and `wrangler secret put SMS_SIGNING_SECRET`.
+[vars]
+ALLOWED_ORIGIN = "https://appassets.androidplatform.net"
+
+# Set ADMIN_TOKEN with `wrangler secret put ADMIN_TOKEN`; never commit its value.
